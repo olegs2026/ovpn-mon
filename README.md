@@ -1,6 +1,6 @@
 # ovpn-mon
 OpenVpn monitoring script
-# ovpn-mon
+# OpenVpm Monitor / Status script
 
 > Универсальная утилита мониторинга и диагностики **OpenVPN** для Linux.
 > Работает одинаково с **нативными** инстансами (systemd / standalone) и
