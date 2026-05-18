@@ -1,0 +1,598 @@
+#!/usr/bin/env bash
+# ovpn-status — universal OpenVPN status (native + docker)
+# -w watch | -s snapshot | -H history | -d diag | -a all | -h help
+# Env: DEBUG=1  WATCH_INTERVAL=3  HISTORY_LIMIT=25  HISTORY_DAYS=7
+set -u
+
+DEBUG="${DEBUG:-0}"
+WATCH_INTERVAL="${WATCH_INTERVAL:-3}"
+HISTORY_LIMIT="${HISTORY_LIMIT:-25}"
+HISTORY_DAYS="${HISTORY_DAYS:-7}"
+
+# ───────────────────────────── colors / ui ───────────────────────────────────
+if [ -t 1 ]; then
+  R=$'\e[0m'; B=$'\e[1m'; D=$'\e[2m'
+  GR=$'\e[32m'; YE=$'\e[33m'; RD=$'\e[31m'
+  CY=$'\e[36m'; BL=$'\e[34m'; MG=$'\e[35m'
+else
+  R=; B=; D=; GR=; YE=; RD=; CY=; BL=; MG=
+fi
+dbg(){ [ "$DEBUG" = "1" ] && printf '%s[debug] %s%s\n' "$D" "$*" "$R" >&2; }
+hr(){  printf '%.0s─' $(seq 1 "${1:-100}"); echo; }
+ok(){    printf ' %sOK%s   %s\n' "$GR" "$R" "$*"; }
+warn(){  printf ' %sWARN%s %s\n' "$YE" "$R" "$*"; }
+fail(){  printf ' %sFAIL%s %s\n' "$RD" "$R" "$*"; }
+info(){  printf ' %s••%s   %s\n' "$CY" "$R" "$*"; }
+title(){ echo; echo "${B}${CY}━━━ $* ━━━${R}"; }
+
+# ───────────────────────────── helpers ───────────────────────────────────────
+human_size(){
+  awk -v b="${1:-0}" 'BEGIN{
+    split("B KB MB GB TB PB",u); i=1
+    while(b>=1024 && i<6){b/=1024; i++}
+    printf "%.2f %s",b,u[i]
+  }'
+}
+human_dur(){
+  local s=${1:-0}; [ "$s" -lt 0 ] && s=0
+  if   [ "$s" -lt 60 ];    then printf "%ds" "$s"
+  elif [ "$s" -lt 3600 ];  then printf "%dm %ds" $((s/60)) $((s%60))
+  elif [ "$s" -lt 86400 ]; then printf "%dh %dm" $((s/3600)) $(((s%3600)/60))
+  else printf "%dd %dh"   $((s/86400)) $(((s%86400)/3600))
+  fi
+}
+state_marker(){
+  local idle=${1:-0}
+  if   [ "$idle" -lt 300 ];  then printf '%s●%s' "$GR" "$R"
+  elif [ "$idle" -lt 1800 ]; then printf '%s●%s' "$YE" "$R"
+  else                            printf '%s●%s' "$RD" "$R"
+  fi
+}
+
+cfg_get(){ # cfg_get <file> <directive>
+  [ -n "${1:-}" ] && [ -r "$1" ] || return 0
+  awk -v k="$2" 'BEGIN{re="^[[:space:]]*"k"[[:space:]]+"}
+    $0 ~ re { sub(re,""); sub(/[[:space:]]*#.*$/,""); print; exit }' "$1" 2>/dev/null
+}
+
+# ────────────────────────── discovery ────────────────────────────────────────
+discover_native(){
+  local -a out=()
+  if command -v systemctl >/dev/null; then
+    while read -r unit _; do
+      [ -z "$unit" ] && continue
+      local inst="${unit#openvpn-server@}"; inst="${inst%.service}"
+      local cfg="/etc/openvpn/server/${inst}.conf"
+      [ -r "$cfg" ] || cfg="/etc/openvpn/${inst}.conf"
+      local pid; pid=$(systemctl show -p MainPID --value "$unit" 2>/dev/null)
+      out+=("native|$unit|$pid|$cfg")
+    done < <(systemctl list-units --type=service --state=running --no-legend 2>/dev/null \
+             | awk '/openvpn[-@]/{print $1}')
+  fi
+  if [ ${#out[@]} -eq 0 ] && [ -d /etc/openvpn ]; then
+    while IFS= read -r cfg; do
+      grep -qE '^[[:space:]]*(server|server-bridge|tls-server)[[:space:]]' "$cfg" 2>/dev/null || continue
+      out+=("native|standalone|?|$cfg")
+    done < <(find /etc/openvpn -maxdepth 3 -name '*.conf' -type f 2>/dev/null)
+  fi
+  [ ${#out[@]} -gt 0 ] && printf '%s\n' "${out[@]}"
+}
+discover_docker(){
+  command -v docker >/dev/null 2>&1 || return
+  docker info >/dev/null 2>&1 || return
+  while read -r cid name image; do
+    [ -z "$cid" ] && continue
+    if docker top "$cid" 2>/dev/null | awk '{print $NF}' | grep -qE '(^|/)openvpn( |$)'; then
+      printf 'docker|%s|%s|%s\n' "$cid" "$name" "$image"
+    elif echo "$image" | grep -qiE 'openvpn'; then
+      printf 'docker|%s|%s|%s\n' "$cid" "$name" "$image"
+    fi
+  done < <(docker ps --format '{{.ID}} {{.Names}} {{.Image}}')
+}
+
+# ──────────────────── status-log printer (v1 + v2/v3) ────────────────────────
+print_status_log(){
+  local src="$1" tmp; tmp="$(mktemp)"
+  if [[ "$src" == docker:* ]]; then
+    local cid path
+    cid="$(cut -d: -f2 <<<"$src")"; path="$(cut -d: -f3- <<<"$src")"
+    docker exec "$cid" cat "$path" >"$tmp" 2>/dev/null \
+      || { rm -f "$tmp"; echo "  ${RD}cannot read $path in $cid${R}"; return; }
+    echo "  ${D}status: docker:$cid:$path${R}"
+  else
+    [ -r "$src" ] || { rm -f "$tmp"; echo "  ${RD}cannot read $src${R}"; return; }
+    cp "$src" "$tmp"
+    echo "  ${D}status: $src${R}"
+  fi
+
+  local updated
+  updated=$(grep -m1 '^Updated' "$tmp" | cut -d, -f2-)
+  [ -n "$updated" ] && echo "  ${D}updated: $updated${R}"
+  echo
+  printf "   ${B}%-20s %-23s %-15s %-12s %-12s %-15s %-20s${R}\n" \
+    "CN" "REAL ADDRESS" "VIRTUAL IP" "RECV" "SENT" "DURATION" "LAST REF"
+  hr 120
+
+  local fmt="v1"
+  grep -q '^CLIENT_LIST,' "$tmp" && fmt="v2"
+
+  local norm; norm="$(mktemp)"
+
+  if [ "$fmt" = "v2" ]; then
+    local rtbl; rtbl="$(mktemp)"
+    awk -F, '/^ROUTING_TABLE/{print $2","$3","$4","$5}' "$tmp" >"$rtbl"
+    while IFS=, read -r _tag cn real vip _vip6 recv sent since since_t _rest; do
+      [ -z "${cn:-}" ] && continue
+      local lref
+      lref=$(awk -F, -v cn="$cn" '$2==cn{print $4; exit}' "$rtbl")
+      [ -z "$lref" ] && lref="$since"
+      printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
+        "$cn" "$real" "${vip:--}" "${recv:-0}" "${sent:-0}" "${since:-}" "${since_t:-}" "$lref" >>"$norm"
+    done < <(grep '^CLIENT_LIST,' "$tmp")
+    rm -f "$rtbl"
+  else
+    awk -F, '
+      /^OpenVPN CLIENT LIST/         {sec="clients"; next}
+      /^ROUTING TABLE/               {sec="routes";  next}
+      /^GLOBAL STATS/                {sec="";        next}
+      /^END$/                        {sec="";        next}
+      /^Updated,/                    {next}
+      /^Common Name,Real Address/    {next}
+      /^Virtual Address,Common Name/ {next}
+      sec=="clients" && NF>=5 { printf "C|%s|%s|%s|%s|%s\n", $1, $2, $3, $4, $5 }
+      sec=="routes"  && NF>=4 { printf "R|%s|%s|%s|%s\n",     $1, $2, $3, $4 }
+    ' "$tmp" > "$norm.raw"
+
+    awk -F'|' '
+      $1=="R" { vip[$3]=$2; lref[$3]=$5; real[$3]=$4 }
+      $1=="C" {
+        cn=$2; r=$3; recv=$4; sent=$5; since=$6
+        v=(cn in vip) ? vip[cn] : "-"
+        lr=(cn in lref) ? lref[cn] : since
+        printf "%s|%s|%s|%s|%s|%s||%s\n", cn, r, v, recv, sent, since, lr
+      }
+    ' "$norm.raw" > "$norm"
+    rm -f "$norm.raw"
+  fi
+
+  local now total_recv=0 total_sent=0 count=0
+  now=$(date +%s)
+
+  while IFS='|' read -r cn real vip recv sent since since_t last_ref; do
+    [ -z "${cn:-}" ] && continue
+    local dur=0 since_e=0
+    if [ -n "${since_t:-}" ]; then
+      since_e="$since_t"
+    elif [ -n "${since:-}" ]; then
+      since_e=$(date -d "$since" +%s 2>/dev/null || echo 0)
+    fi
+    [ "$since_e" -gt 0 ] && dur=$(( now - since_e ))
+
+    local last_ref_t idle=0
+    if [ -n "${last_ref:-}" ]; then
+      last_ref_t=$(date -d "$last_ref" +%s 2>/dev/null || echo "$now")
+      idle=$(( now - last_ref_t ))
+    fi
+    printf " %s %-20s %-23s %-15s %-12s %-12s %-15s %-20s\n" \
+      "$(state_marker "$idle")" "$cn" "$real" "${vip:--}" \
+      "$(human_size "${recv:-0}")" "$(human_size "${sent:-0}")" \
+      "$(human_dur "$dur")" "${last_ref:--}"
+    total_recv=$((total_recv + ${recv:-0}))
+    total_sent=$((total_sent + ${sent:-0}))
+    count=$((count+1))
+  done < "$norm"
+
+  hr 120
+  echo "   ${B}Итого:${R} ${count} клиент(ов) онлайн  •  RECV: $(human_size $total_recv)  SENT: $(human_size $total_sent)  •  format: $fmt"
+  rm -f "$tmp" "$norm"
+}
+
+# ─────────────────────────── history parser ──────────────────────────────────
+print_history_from_file(){
+  local logf="$1"
+  [ -r "$logf" ] || return 1
+  local since_epoch; since_epoch=$(date -d "$HISTORY_DAYS days ago" +%s 2>/dev/null || echo 0)
+  local cur_year; cur_year=$(date +%Y)
+
+  [ "${SUPPRESS_SOURCE:-0}" = "1" ] || echo "  ${D}source: $logf${R}"
+  printf "   ${B}%-20s %-11s %-20s %-23s %s${R}\n" "TIME" "EVENT" "CN" "REAL ADDRESS" "DETAILS"
+  hr 110
+
+  grep -aE 'Peer Connection Initiated|client-instance exiting|Inactivity timeout|TLS Error: TLS handshake failed|AUTH_FAILED|VERIFY OK: depth=0' "$logf" 2>/dev/null \
+    | tail -n 5000 \
+    | awk -v since="$since_epoch" -v CY="$cur_year" '
+        function mon(m,   i,M) {
+          M="JanFebMarAprMayJunJulAugSepOctNovDec"
+          i=index(M,m); return (i>0) ? (i+2)/3 : 0
+        }
+        {
+          ts=""; rest=""; start=0
+
+          if ($1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/) {
+            d=$1; sub("T"," ",d); sub(/[+\-][0-9:]+$/,"",d); sub(/Z$/,"",d); sub(/\.[0-9]+$/,"",d); ts=d
+            start=4
+          }
+          else if ($1 ~ /^[A-Z][a-z][a-z]$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+:[0-9]+:[0-9]+$/) {
+            ts=sprintf("%04d-%02d-%02d %s", CY, mon($1), $2, $3)
+            start=6
+          }
+          else if ($1 ~ /^[A-Z][a-z][a-z]$/ && $5 ~ /^[0-9][0-9][0-9][0-9]$/) {
+            ts=sprintf("%04d-%02d-%02d %s", $5, mon($2), $3, $4)
+            start=6
+          }
+          else next
+
+          for (i=start; i<=NF; i++) rest = rest " " $i
+          sub(/^ /,"",rest)
+
+          cmd="date -d \"" ts "\" +%s 2>/dev/null"
+          cmd | getline epoch; close(cmd)
+          if (epoch+0 < since+0) next
+
+          ev=""
+          if      (rest ~ /Peer Connection Initiated/) ev="CONNECT"
+          else if (rest ~ /client-instance exiting/)   ev="DISCONNECT"
+          else if (rest ~ /Inactivity timeout/)        ev="TIMEOUT"
+          else if (rest ~ /TLS handshake failed/)      ev="TLS-FAIL"
+          else if (rest ~ /AUTH_FAILED/)               ev="AUTH-FAIL"
+          else if (rest ~ /VERIFY OK: depth=0/)        ev="AUTH-OK"
+          else next
+
+          cn="-"; real="-"
+          if (match(rest, /[A-Za-z0-9_.\-]+\/[0-9.]+:[0-9]+/)) {
+            tok=substr(rest, RSTART, RLENGTH)
+            split(tok, pp, "/")
+            cn=pp[1]; real=pp[2]
+          }
+          if (cn=="-") {
+            s=rest
+            while (match(s, /$$[A-Za-z0-9_.\-]+$$/) > 0) {
+              cand=substr(s, RSTART+1, RLENGTH-2)
+              if (cand !~ /^AF_INET/) { cn=cand; break }
+              s=substr(s, RSTART+RLENGTH)
+            }
+          }
+          if (cn=="-" && match(rest, /CN=[A-Za-z0-9_.\-]+/) > 0) {
+            cn=substr(rest, RSTART+3, RLENGTH-3)
+          }
+          if (real=="-" && match(rest, /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+/) > 0) {
+            real=substr(rest, RSTART, RLENGTH)
+          }
+
+          key=ts"|"ev"|"cn"|"real
+          if (key==last) next; last=key
+          printf "%s|%s|%s|%s|%s\n", ts, ev, cn, real, rest
+        }' \
+    | tail -n "$HISTORY_LIMIT" \
+    | awk -F'|' -v GR="$GR" -v RD="$RD" -v YE="$YE" -v R="$R" '
+        {
+          col=R
+          if      ($2=="CONNECT")    col=GR
+          else if ($2=="AUTH-OK")    col=GR
+          else if ($2=="DISCONNECT") col=YE
+          else if ($2=="TIMEOUT")    col=YE
+          else if ($2=="TLS-FAIL")   col=RD
+          else if ($2=="AUTH-FAIL")  col=RD
+          d=$5; if (length(d)>50) d=substr(d,1,47)"..."
+          printf " %-20s %s%-11s%s %-20s %-23s %s\n", $1, col, $2, R, $3, $4, d
+        }'
+}
+
+print_history_from_journal(){
+  local unit="$1"
+  command -v journalctl >/dev/null 2>&1 || return 1
+  echo "  ${D}source: journalctl -u $unit (last ${HISTORY_DAYS}d)${R}"
+  local tmp; tmp="$(mktemp)"
+  journalctl -u "$unit" --since "${HISTORY_DAYS} days ago" \
+             --no-pager --output=short-iso 2>/dev/null >"$tmp" \
+    || { rm -f "$tmp"; return 1; }
+  SUPPRESS_SOURCE=1 print_history_from_file "$tmp"
+  rm -f "$tmp"
+}
+
+print_history_from_docker(){
+  local cid="$1"
+  local hours=$(( HISTORY_DAYS * 24 ))
+  echo "  ${D}source: docker logs $cid (last ${hours}h)${R}"
+  local tmp; tmp="$(mktemp)"
+  docker logs --since "${hours}h" "$cid" >"$tmp" 2>&1 \
+    || docker logs "$cid" >"$tmp" 2>&1 \
+    || true
+  SUPPRESS_SOURCE=1 print_history_from_file "$tmp"
+  rm -f "$tmp"
+}
+
+# ─────────────────────────── diagnostics ─────────────────────────────────────
+diag_system(){
+  title "System / Kernel"
+  info "uname: $(uname -srm)"
+  info "uptime:$(uptime -p 2>/dev/null || uptime)"
+  if [ -r /proc/sys/net/ipv4/ip_forward ]; then
+    local f; f=$(cat /proc/sys/net/ipv4/ip_forward)
+    [ "$f" = "1" ] && ok "net.ipv4.ip_forward = 1" || fail "net.ipv4.ip_forward = $f (нужен 1)"
+  fi
+  if ip link 2>/dev/null | grep -qE 'tun[0-9]+'; then
+    ok "tun: $(ip -br addr | grep -E '^tun' | tr -s ' ')"
+  else
+    warn "tun-интерфейсы не найдены на хосте (для docker — норма)"
+  fi
+}
+diag_ports(){
+  title "Listening ports (openvpn)"
+  if command -v ss >/dev/null; then
+    local out; out=$( (ss -lnup 2>/dev/null; ss -lntp 2>/dev/null) | grep -i openvpn )
+    [ -n "$out" ] && echo "$out" | sed 's/^/  /' || warn "ss не нашёл сокетов openvpn на хосте (для docker — норма)"
+  else
+    warn "ss недоступен"
+  fi
+}
+diag_firewall(){
+  title "Firewall / NAT"
+  if command -v nft >/dev/null && nft list ruleset >/dev/null 2>&1; then
+    local n; n=$(nft list ruleset 2>/dev/null | grep -cE 'masquerade|10\.8\.0')
+    [ "$n" -gt 0 ] && ok "nftables: $n правил VPN/masquerade" || warn "nftables: правил для VPN не видно"
+  fi
+  if command -v iptables >/dev/null; then
+    local n; n=$(iptables -t nat -S 2>/dev/null | grep -cE 'MASQUERADE|10\.8\.0')
+    [ "$n" -gt 0 ] && ok "iptables NAT: $n правил" || warn "iptables NAT: правил не найдено"
+  fi
+}
+diag_certs(){
+  local cfg="$1" base; base=$(dirname "$cfg")
+  title "Certificates / Keys ($cfg)"
+  local tmp; tmp="$(mktemp -d)"
+
+  for tag in ca cert; do
+    awk -v t="$tag" '
+      $0 ~ "^<"t">"  {flag=1; next}
+      $0 ~ "^</"t">" {flag=0}
+      flag {print}
+    ' "$cfg" > "$tmp/$tag.pem"
+    [ -s "$tmp/$tag.pem" ] || rm -f "$tmp/$tag.pem"
+  done
+
+  local ca cert key dh ta
+  ca=$(cfg_get   "$cfg" ca)
+  cert=$(cfg_get "$cfg" cert)
+  key=$(cfg_get  "$cfg" key)
+  dh=$(cfg_get   "$cfg" dh)
+  ta=$(cfg_get   "$cfg" tls-auth);   [ -z "$ta" ] && ta=$(cfg_get "$cfg" tls-crypt)
+  [ -z "$ta" ] && ta=$(cfg_get "$cfg" tls-crypt-v2)
+
+  ca=${ca%% *}; cert=${cert%% *}; key=${key%% *}; dh=${dh%% *}; ta=${ta%% *}
+
+  check_cert(){
+    local label="$1" file="$2"
+    [ -r "$file" ] || { warn "$label: $file — недоступен"; return; }
+    command -v openssl >/dev/null || { info "$label: $file (нет openssl)"; return; }
+    local subj end et now days
+    subj=$(openssl x509 -in "$file" -noout -subject 2>/dev/null | sed 's/^subject= *//')
+    end=$(openssl x509 -in "$file" -noout -enddate 2>/dev/null | cut -d= -f2)
+    [ -z "$end" ] && { warn "$label: $file — не PEM"; return; }
+    et=$(date -d "$end" +%s 2>/dev/null); now=$(date +%s)
+    days=$(( (et-now)/86400 ))
+    if   [ "$days" -lt 0 ];  then fail "$label  ИСТЁК ($end)   $subj"
+    elif [ "$days" -lt 30 ]; then warn "$label  истекает через $days дн. ($end)   $subj"
+    else                          ok   "$label  ещё $days дн. (до $end)   $subj"
+    fi
+  }
+
+  if   [ -s "$tmp/ca.pem" ];   then check_cert "CA   (inline)" "$tmp/ca.pem"
+  elif [ -n "$ca" ];           then [[ "$ca" != /* ]] && ca="$base/$ca";       check_cert "CA  " "$ca"
+  else warn "CA не задан"
+  fi
+  if   [ -s "$tmp/cert.pem" ]; then check_cert "CERT (inline)" "$tmp/cert.pem"
+  elif [ -n "$cert" ];         then [[ "$cert" != /* ]] && cert="$base/$cert"; check_cert "CERT" "$cert"
+  else warn "server cert не задан"
+  fi
+
+  if   grep -q '^<key>' "$cfg"; then ok "KEY  (inline) присутствует"
+  elif [ -n "$key" ]; then [[ "$key" != /* ]] && key="$base/$key"
+       [ -r "$key" ] && ok "KEY  $key" || warn "KEY  $key — недоступен"
+  fi
+  if   grep -q '^<dh>' "$cfg"; then ok "DH   (inline) присутствует"
+  elif [ -n "$dh" ]; then [[ "$dh" != /* ]] && dh="$base/$dh"
+       [ -r "$dh" ] && ok "DH   $dh" || warn "DH   $dh — недоступен"
+  fi
+  if   grep -qE '^<tls-(auth|crypt|crypt-v2)>' "$cfg"; then ok "TLS-AUTH/CRYPT (inline) присутствует"
+  elif [ -n "$ta" ]; then [[ "$ta" != /* ]] && ta="$base/$ta"
+       [ -r "$ta" ] && ok "TA   $ta" || warn "TA   $ta — недоступен"
+  fi
+
+  rm -rf "$tmp"
+}
+diag_logs(){
+  local cfg="$1"
+  title "Logs"
+  local lg; lg=$(cfg_get "$cfg" log-append); [ -z "$lg" ] && lg=$(cfg_get "$cfg" log)
+  lg=${lg%% *}
+  [ -z "$lg" ] && lg="/var/log/openvpn/openvpn.log"
+  if [ -r "$lg" ]; then
+    local sz mt; sz=$(stat -c%s "$lg" 2>/dev/null); mt=$(stat -c%y "$lg" 2>/dev/null | cut -d. -f1)
+    ok "$lg  ($(human_size "$sz"), mtime $mt)"
+    echo "  ${D}--- tail -n5 ---${R}"
+    tail -n5 "$lg" | sed "s/^/  $D/;s/$/$R/"
+  else
+    warn "$lg — недоступен (логи могут идти в journalctl — см. -H)"
+  fi
+}
+diag_config_check(){
+  local cfg="$1"
+  title "Config sanity ($cfg)"
+  for d in port proto dev server cipher; do
+    local v; v=$(cfg_get "$cfg" "$d")
+    [ -n "$v" ] && info "$d: $v" || warn "$d: не задан"
+  done
+}
+diag_docker_one(){
+  local cid="$1" name="$2"
+  title "Docker: $name ($cid)"
+  local state; state=$(docker inspect -f '{{.State.Status}} (restarts={{.RestartCount}})' "$cid" 2>/dev/null)
+  info "state: $state"
+  info "ports: $(docker port "$cid" 2>/dev/null | tr '\n' ' ')"
+  info "version: $(docker exec "$cid" openvpn --version 2>/dev/null | head -1)"
+  local cfg; cfg=$(docker exec "$cid" sh -c '
+    for f in /etc/openvpn/server.conf /etc/openvpn/openvpn.conf /etc/openvpn/server/server.conf; do
+      [ -r "$f" ] && echo "$f" && exit
+    done' 2>/dev/null)
+  [ -n "$cfg" ] && ok "config: $cfg" || warn "config не найден в стандартных путях"
+  local tunl; tunl=$(docker exec "$cid" sh -c 'ip -br addr 2>/dev/null | grep -E "^tun"' 2>/dev/null)
+  [ -n "$tunl" ] && ok "tun (in container): $(echo "$tunl" | tr -s ' ')" || warn "tun не найден внутри контейнера"
+  local sock
+  sock=$(docker exec "$cid" sh -c '(ss -lnup 2>/dev/null; netstat -lnup 2>/dev/null) | grep -iE "openvpn|:1194"' 2>/dev/null | head -3)
+  [ -n "$sock" ] && echo "  ${D}listen (in container):${R}" && echo "$sock" | sed 's/^/    /' \
+    || warn "сокет openvpn внутри контейнера не виден (нет ss/netstat?)"
+}
+
+# ─────────────────────────── render sections ─────────────────────────────────
+header(){
+  echo "${B}╔══════════════════════════════════════════════════════════════════════════════════════════════════╗${R}"
+  printf "${B}║${R} %-96s ${B}║${R}\n" "  OpenVPN — Universal Status   (mode: $1)"
+  echo "${B}╚══════════════════════════════════════════════════════════════════════════════════════════════════╝${R}"
+  echo " Host   : $(hostname)    Time: $(date '+%F %T %Z')"
+  local bin ver
+  bin="$(command -v openvpn || echo '-')"
+  ver="$([ -x "$bin" ] && "$bin" --version 2>/dev/null | head -1 || echo 'not installed')"
+  echo " Native : $bin"
+  echo " Version: $ver"
+}
+
+section_watch(){
+  mapfile -t NATIVE < <(discover_native)
+  mapfile -t DOCKERS < <(discover_docker)
+  title "Native instances (${#NATIVE[@]})"
+  if [ ${#NATIVE[@]} -eq 0 ]; then echo "  ${D}нет нативных инстансов${R}"
+  else
+    for row in "${NATIVE[@]}"; do
+      IFS='|' read -r _ unit pid cfg <<<"$row"
+      echo; echo " ${B}┌─ instance${R} unit=$unit  pid=$pid"
+      echo " ${B}│${R}  config: $cfg"
+      local sl; sl=$(cfg_get "$cfg" status); sl=${sl%% *}
+      [ -z "$sl" ] && sl="/var/log/openvpn/openvpn-status.log"
+      [[ "$sl" != /* ]] && sl="/etc/openvpn/$sl"
+      echo " ${B}└─${R}  status-log: $sl"; echo
+      print_status_log "$sl"
+    done
+  fi
+  title "Docker instances (${#DOCKERS[@]})"
+  if [ ${#DOCKERS[@]} -eq 0 ]; then echo "  ${D}OpenVPN в Docker не обнаружен${R}"
+  else
+    for row in "${DOCKERS[@]}"; do
+      IFS='|' read -r _ cid name image <<<"$row"
+      echo; echo " ${B}┌─ container${R} $name (${cid:0:12})  image=$image"
+      local sl; sl=$(docker exec "$cid" sh -c '
+        for f in /etc/openvpn/server.conf /etc/openvpn/openvpn.conf /etc/openvpn/server/server.conf; do
+          [ -r "$f" ] && awk "/^[[:space:]]*status[[:space:]]/{print \$2; exit}" "$f" && exit
+        done' 2>/dev/null)
+      [ -z "$sl" ] && sl="/tmp/openvpn-status.log"
+      echo " ${B}└─${R}  status: $sl"; echo
+      print_status_log "docker:$cid:$sl"
+    done
+  fi
+  echo; echo "${D}Легенда: ${GR}●${R}${D} активен (<5m)   ${YE}●${R}${D} idle 5-30m   ${RD}●${R}${D} idle >30m${R}"
+}
+
+section_history(){
+  mapfile -t NATIVE  < <(discover_native)
+  mapfile -t DOCKERS < <(discover_docker)
+  title "History — Native (last ${HISTORY_LIMIT} events, ${HISTORY_DAYS}d)"
+  if [ ${#NATIVE[@]} -eq 0 ]; then echo "  ${D}нет нативных инстансов${R}"
+  else
+    for row in "${NATIVE[@]}"; do
+      IFS='|' read -r _ unit pid cfg <<<"$row"
+      echo; echo " ${B}■ $unit${R}  ($cfg)"
+      local lg; lg=$(cfg_get "$cfg" log-append); [ -z "$lg" ] && lg=$(cfg_get "$cfg" log)
+      lg=${lg%% *}
+      [ -n "$lg" ] && [[ "$lg" != /* ]] && lg="/etc/openvpn/$lg"
+      if   [ -n "$lg" ] && [ -r "$lg" ];        then print_history_from_file "$lg"
+      elif [ -r /var/log/openvpn/openvpn.log ]; then print_history_from_file /var/log/openvpn/openvpn.log
+      elif [ "$unit" != "standalone" ];         then print_history_from_journal "$unit" || echo "  ${D}нет данных${R}"
+      else echo "  ${D}история недоступна${R}"
+      fi
+    done
+  fi
+  title "History — Docker"
+  if [ ${#DOCKERS[@]} -eq 0 ]; then echo "  ${D}нет docker-инстансов${R}"
+  else
+    for row in "${DOCKERS[@]}"; do
+      IFS='|' read -r _ cid name image <<<"$row"
+      echo; echo " ${B}■ $name${R} (${cid:0:12})"
+      print_history_from_docker "$cid"
+    done
+  fi
+}
+
+section_diag(){
+  mapfile -t NATIVE  < <(discover_native)
+  mapfile -t DOCKERS < <(discover_docker)
+  diag_system
+  diag_ports
+  diag_firewall
+  for row in "${NATIVE[@]}"; do
+    IFS='|' read -r _ unit pid cfg <<<"$row"
+    title "Native instance: $unit"
+    if [ "$unit" != "standalone" ]; then
+      local st; st=$(systemctl is-active "$unit" 2>/dev/null)
+      [ "$st" = "active" ] && ok "systemd: $st" || fail "systemd: $st"
+      info "since: $(systemctl show -p ActiveEnterTimestamp --value "$unit" 2>/dev/null)"
+    fi
+    diag_config_check "$cfg"
+    diag_certs "$cfg"
+    diag_logs "$cfg"
+  done
+  for row in "${DOCKERS[@]}"; do
+    IFS='|' read -r _ cid name image <<<"$row"
+    diag_docker_one "$cid" "$name"
+  done
+}
+
+# ─────────────────────────── CLI ─────────────────────────────────────────────
+usage(){
+  cat <<EOF
+${B}ovpn-mon${R} — universal OpenVPN status (native + docker)
+
+Usage:
+  ovpn-mon [-w|-s|-H|-d|-a|-h]
+
+Commands:
+  ${B}-w, --watch${R}     online clients, авто-обновление каждые ${WATCH_INTERVAL}s   [default]
+  ${B}-s, --snapshot${R}  один снимок watch (без цикла)
+  ${B}-H, --history${R}   historical connect/disconnect events
+  ${B}-d, --diag${R}      diagnostics (ports, firewall, certs, logs)
+  ${B}-a, --all${R}       snapshot + history + diag
+  ${B}-h, --help${R}      show this help
+
+Env:
+  DEBUG=1                 verbose discovery
+  WATCH_INTERVAL=3        интервал обновления (-w), сек
+  HISTORY_LIMIT=25        max events shown (-H)
+  HISTORY_DAYS=7          how far back to look
+
+Hotkeys (в -w):
+  Ctrl+C                  выход
+EOF
+}
+
+run_watch_loop(){
+  printf '\e[?25l'
+  trap 'printf "\e[?25h\n%s…вышли из watch%s\n" "$D" "$R"; exit 0' INT TERM
+  while :; do
+    clear
+    header "watch (every ${WATCH_INTERVAL}s, Ctrl+C — exit)"
+    section_watch
+    printf '\n%sNext refresh in %ss…%s' "$D" "$WATCH_INTERVAL" "$R"
+    sleep "$WATCH_INTERVAL" || break
+  done
+  printf '\e[?25h'
+}
+
+MODE="${1:-watch}"
+case "$MODE" in
+  -w|--watch|watch|"")     run_watch_loop ;;
+  -s|--snapshot|snapshot)  header "snapshot"; section_watch ;;
+  -H|--history|history)    header "history";  section_history ;;
+  -d|--diag|diag)          header "diag";     section_diag ;;
+  -a|--all|all)            header "all";      section_watch; section_history; section_diag ;;
+  -h|--help|help)          usage ;;
+  *) echo "${RD}Unknown option:${R} $MODE"; echo; usage; exit 2 ;;
+esac
