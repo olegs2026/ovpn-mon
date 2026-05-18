@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ovpn-status — universal OpenVPN status (native + docker)
+# ovpn-mon — universal OpenVPN status (native + docker)
 # -w watch | -s snapshot | -H history | -d diag | -a all | -h help
 # Env: DEBUG=1  WATCH_INTERVAL=3  HISTORY_LIMIT=25  HISTORY_DAYS=7
 set -u
@@ -131,6 +131,7 @@ print_status_log(){
     done < <(grep '^CLIENT_LIST,' "$tmp")
     rm -f "$rtbl"
   else
+    # v1
     awk -F, '
       /^OpenVPN CLIENT LIST/         {sec="clients"; next}
       /^ROUTING TABLE/               {sec="routes";  next}
@@ -144,12 +145,16 @@ print_status_log(){
     ' "$tmp" > "$norm.raw"
 
     awk -F'|' '
-      $1=="R" { vip[$3]=$2; lref[$3]=$5; real[$3]=$4 }
+      $1=="R" { vip[$3]=$2; lref[$3]=$5 }
       $1=="C" {
-        cn=$2; r=$3; recv=$4; sent=$5; since=$6
-        v=(cn in vip) ? vip[cn] : "-"
-        lr=(cn in lref) ? lref[cn] : since
-        printf "%s|%s|%s|%s|%s|%s||%s\n", cn, r, v, recv, sent, since, lr
+        n++; cn[n]=$2; rr[n]=$3; rx[n]=$4; tx[n]=$5; since[n]=$6
+      }
+      END {
+        for (i=1; i<=n; i++) {
+          v  = (cn[i] in vip)  ? vip[cn[i]]  : "-"
+          lr = (cn[i] in lref) ? lref[cn[i]] : since[i]
+          printf "%s|%s|%s|%s|%s|%s||%s\n", cn[i], rr[i], v, rx[i], tx[i], since[i], lr
+        }
       }
     ' "$norm.raw" > "$norm"
     rm -f "$norm.raw"
