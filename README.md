@@ -38,7 +38,7 @@ OpenVpn monitoring script
 ## 📦 Установка
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/<YOUR_USER>/ovpn-mon/main/ovpn-mon \
+sudo curl -fsSL https://raw.githubusercontent.com/olegs2026/ovpn-mon/main/ovpn-mon \
   -o /usr/local/bin/ovpn-mon
 sudo chmod +x /usr/local/bin/ovpn-mon
 ```
@@ -46,7 +46,7 @@ sudo chmod +x /usr/local/bin/ovpn-mon
 Или вручную:
 
 ```bash
-git clone https://github.com/<YOUR_USER>/ovpn-mon.git
+git clone https://github.com/olegs2026/ovpn-mon.git
 cd ovpn-mon
 sudo install -m 755 ovpn-mon /usr/local/bin/ovpn-mon
 ```
